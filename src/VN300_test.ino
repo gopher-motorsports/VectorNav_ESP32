@@ -1,5 +1,5 @@
 #include <ESP32-TWAI-CAN.hpp>
-
+#include "CAN_OFFSET_SCALE.h"
 #include <TelnetStream.h>
 #include <TelnetPrint.h>
 #include "OTA.h"
@@ -9,16 +9,16 @@
 #define CAN_TX 25
 #define CAN_RX 26
 #define MAX_TX 17
-#define MAX_RX 5
-#define HBT_LED 22
+#define MAX_RX 16
+#define HBT_LED 2
 
 float rc = 1 / (6.28318 * FILTER_CUTOFF_FREQ);
 float tp = BINARY_OUTPUT_RATE_DIVIDER / 400.0;
 float filt_coeff[2] = { tp / (tp + rc), rc / (tp + rc) };
 
-const float RFR[3][3] = { { 1.0, 0, 0 }, { 0, 1.0, 0 }, { 0, 0, 1.0 } };
-const float GNSSA_offset[3] = { -1.1, -0.33, -0.51 };
-const float GNSSB_baseline[6] = { 0, 0.67, 0, 0.02, 0.02, 0.02 };
+const float RFR[3][3] = { { -1.0, 0, 0 }, { 0, -1.0, 0 }, { 0, 0, 1.0 } };
+const float GNSSA_offset[3] = { 1.32, 0.0, -0.508 };
+const float GNSSB_baseline[6] = { -0.6508, 0, 0, 0.02, 0.02, 0.02 };
 
 void TaskVN300Config(void *pvParameters);
 void TaskVN300CheckStatus(void *pvParameters);
@@ -176,19 +176,38 @@ void setup() {
   Serial.begin(115200);
 
   twai_general_config_t noack_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)(CAN_TX), (gpio_num_t)(CAN_RX), TWAI_MODE_NO_ACK);
-  ESP32Can.begin(ESP32Can.convertSpeed(500), CAN_TX, CAN_RX, 10, 10, nullptr, &noack_config);
+  ESP32Can.begin(ESP32Can.convertSpeed(1000), CAN_TX, CAN_RX, 10, 10, nullptr, &noack_config);
 
   xTaskCreatePinnedToCore(TaskVN300Config, "Initial config task", 2048, NULL, 1, &VN300_Config_Task_Handle, 1);
   xTaskCreatePinnedToCore(TaskVN300CheckStatus, "Check INS status", 2048, NULL, 1, &VN300_Check_Status_Task_Handle, 1);
   xTaskCreatePinnedToCore(TaskVN300Update, "VN300 Update values", 4096, NULL, 1, &VN300_Update_Task_Handle, 1);
   xTaskCreatePinnedToCore(TaskOTAHandleAlive, "OTA handle", 16384, NULL, 1, &OTA_Handle_Alive_Task_Handle, 1);
-  xTaskCreatePinnedToCore(TaskTelnetPrint, "Debug print", 8192, NULL, 1, &Telnet_Print_Task_Handle, 0);
+  xTaskCreatePinnedToCore(TaskTelnetPrint, "Debug print", 8192, NULL, 1, &Telnet_Print_Task_Handle, 1);
   xTaskCreatePinnedToCore(TaskSerialPrint, "Debug print serial", 4096, NULL, 1, &Serial_Print_Task_Handle, 1);
-  xTaskCreatePinnedToCore(TaskAttitudeFilt, "Attitude filter", 1024, NULL, 1, &Attitude_Filt_Task_Handle, 1);
-  xTaskCreatePinnedToCore(TaskIMUFilt, "IMU Gyro filter", 1024, NULL, 1, &IMU_Filt_Task_Handle, 1);
+  xTaskCreatePinnedToCore(TaskAttitudeFilt, "Attitude filter", 2048, NULL, 1, &Attitude_Filt_Task_Handle, 1);
+  xTaskCreatePinnedToCore(TaskIMUFilt, "IMU Gyro filter", 2048, NULL, 1, &IMU_Filt_Task_Handle, 1);
   xTaskCreatePinnedToCore(TaskCANComms, "CAN Comms", 4096, NULL, 1, &CAN_Comms_Task_Handle, 1);
 
   delay(1000);
+}
+
+void filterOne(QueueHandle_t rawQ, QueueHandle_t filtQ) {
+  float raw = 0.0f;
+  float prev = 0.0f;
+  float out = 0.0f;
+
+  xQueuePeek(rawQ, &raw, portMAX_DELAY);
+  xQueuePeek(filtQ, &prev, portMAX_DELAY);
+  if (!isfinite(raw) || fabs(raw) > 50.0f) {
+    return;  // reject bad gyro sample
+  }
+  if (!isfinite(prev) || fabs(prev) > 50.0f) {
+    prev = raw;  // recover from poisoned previous value
+  }
+  out = raw * filt_coeff[0] + prev * filt_coeff[1];
+  if (isfinite(out)) {
+    xQueueOverwrite(filtQ, &out);
+  }
 }
 
 void append_ascii_checksum(String &cmd) {
@@ -228,7 +247,7 @@ bool send_message(String &cmd) {
     }
   }
 
-  Serial.println(rx);
+  //Serial.println(rx);
   return true;
 }
 
@@ -246,7 +265,7 @@ bool crc_calc(String &cmd, uint16_t crc_rec) {
 }
 
 void TaskVN300Config(void *pvParameters) {
-  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  //ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
   String c[9];
   c[0] = "$VNWRG,06,0";
   c[1] = "$VNWRG,05,115200";
@@ -387,7 +406,7 @@ void TaskVN300Update(void *pvParameters) {
   for (uint8_t j = 0; j < 6; j++) {
     bool txs = send_message(cm[j]);
   }
-  Serial.println("Binary registers configured");
+  //Serial.println("Binary registers configured");
   vTaskDelay(10 / portTICK_PERIOD_MS);
   while (1) {
     switch (i) {
@@ -399,7 +418,7 @@ void TaskVN300Update(void *pvParameters) {
         if (c == 0xFA) {
           i = 1;
           msg += String(c);
-          vTaskDelay(10 / portTICK_PERIOD_MS);
+          vTaskDelay(1 / portTICK_PERIOD_MS);
         } else {
           i = 0;
         }
@@ -675,7 +694,7 @@ void TaskOTAHandleAlive(void *pvParameters) {
       vTaskDelay(3000 / portTICK_PERIOD_MS);
     }
   }
-  xTaskNotifyGive(VN300_Config_Task_Handle);
+  //xTaskNotifyGive(VN300_Config_Task_Handle);
   while (1) {
     ArduinoOTA.handle();
     vTaskDelay(93 / portTICK_PERIOD_MS);
@@ -754,27 +773,27 @@ void TaskTelnetPrint(void *pvParemeters) {
         TelnetStream.print(t3, 4);
         TelnetStream.print(" deg\r\n");
         TelnetStream.print("Quat: ");
-        xQueuePeek(QuatX, &t3, portMAX_DELAY);
+        xQueuePeek(QuatX_filt, &t3, portMAX_DELAY);
         TelnetStream.print(t3, 4);
         TelnetStream.print(" ");
-        xQueuePeek(QuatY, &t3, portMAX_DELAY);
+        xQueuePeek(QuatY_filt, &t3, portMAX_DELAY);
         TelnetStream.print(t3, 4);
         TelnetStream.print(" ");
-        xQueuePeek(QuatZ, &t3, portMAX_DELAY);
+        xQueuePeek(QuatZ_filt, &t3, portMAX_DELAY);
         TelnetStream.print(t3, 4);
         TelnetStream.print(" ");
-        xQueuePeek(QuatS, &t3, portMAX_DELAY);
+        xQueuePeek(QuatS_filt, &t3, portMAX_DELAY);
         TelnetStream.print(t3, 4);
         TelnetStream.print("\r\n");
-        xQueuePeek(LinBodyAccX, &t3, portMAX_DELAY);
+        xQueuePeek(LinBodyAccX_filt, &t3, portMAX_DELAY);
         TelnetStream.print("Ax: ");
         TelnetStream.print(t3, 4);
         TelnetStream.print(" m/s^2\r\n");
-        xQueuePeek(LinBodyAccY, &t3, portMAX_DELAY);
+        xQueuePeek(LinBodyAccY_filt, &t3, portMAX_DELAY);
         TelnetStream.print("Ay: ");
         TelnetStream.print(t3, 4);
         TelnetStream.print(" m/s^2\r\n");
-        xQueuePeek(LinBodyAccZ, &t3, portMAX_DELAY);
+        xQueuePeek(LinBodyAccZ_filt, &t3, portMAX_DELAY);
         TelnetStream.print("Az: ");
         TelnetStream.print(t3, 4);
         TelnetStream.print(" m/s^2\r\n");
@@ -803,15 +822,15 @@ void TaskTelnetPrint(void *pvParemeters) {
         xQueuePeek(TimeUtcF, &t1, portMAX_DELAY);
         TelnetStream.print(t1);
         TelnetStream.print("\r\n");
-        xQueuePeek(GyroBodyX, &t3, portMAX_DELAY);
+        xQueuePeek(GyroBodyX_filt, &t3, portMAX_DELAY);
         TelnetStream.print("Gx: ");
         TelnetStream.print(t3, 4);
         TelnetStream.print(" rad/s\r\n");
-        xQueuePeek(GyroBodyY, &t3, portMAX_DELAY);
+        xQueuePeek(GyroBodyY_filt, &t3, portMAX_DELAY);
         TelnetStream.print("Gy: ");
         TelnetStream.print(t3, 4);
         TelnetStream.print(" rad/s\r\n");
-        xQueuePeek(GyroBodyZ, &t3, portMAX_DELAY);
+        xQueuePeek(GyroBodyZ_filt, &t3, portMAX_DELAY);
         TelnetStream.print("Gz: ");
         TelnetStream.print(t3, 4);
         TelnetStream.print(" rad/s\r\n");
@@ -857,9 +876,9 @@ void TaskSerialPrint(void *pvParemeters) {
     xQueuePeek(Yaw, &y_temp, portMAX_DELAY);
     xQueuePeek(Pitch, &p_temp, portMAX_DELAY);
     xQueuePeek(Roll, &r_temp, portMAX_DELAY);
-    xQueuePeek(LinBodyAccX, &lbax_temp, portMAX_DELAY);
-    xQueuePeek(LinBodyAccY, &lbay_temp, portMAX_DELAY);
-    xQueuePeek(LinBodyAccZ, &lbaz_temp, portMAX_DELAY);
+    xQueuePeek(LinBodyAccX_filt, &lbax_temp, portMAX_DELAY);
+    xQueuePeek(LinBodyAccY_filt, &lbay_temp, portMAX_DELAY);
+    xQueuePeek(LinBodyAccZ_filt, &lbaz_temp, portMAX_DELAY);
     xQueuePeek(TimeUtcY, &ty_temp, portMAX_DELAY);
     xQueuePeek(TimeUtcMonth, &tmon_temp, portMAX_DELAY);
     xQueuePeek(TimeUtcD, &td_temp, portMAX_DELAY);
@@ -867,9 +886,9 @@ void TaskSerialPrint(void *pvParemeters) {
     xQueuePeek(TimeUtcMin, &tmin_temp, portMAX_DELAY);
     xQueuePeek(TimeUtcS, &ts_temp, portMAX_DELAY);
     xQueuePeek(TimeUtcF, &tf_temp, portMAX_DELAY);
-    xQueuePeek(GyroBodyX, &gbx_temp, portMAX_DELAY);
-    xQueuePeek(GyroBodyY, &gby_temp, portMAX_DELAY);
-    xQueuePeek(GyroBodyZ, &gbz_temp, portMAX_DELAY);
+    xQueuePeek(GyroBodyX_filt, &gbx_temp, portMAX_DELAY);
+    xQueuePeek(GyroBodyY_filt, &gby_temp, portMAX_DELAY);
+    xQueuePeek(GyroBodyZ_filt, &gbz_temp, portMAX_DELAY);
     Serial.print(ins_status_temp, BIN);
     Serial.print(",");
     Serial.print(lat_temp, 7);
@@ -971,18 +990,9 @@ void TaskIMUFilt(void *pvParemeters) {
   float t3 = 0.0;
   while (1) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    xQueuePeek(GyroBodyX, &t1, portMAX_DELAY);
-    xQueuePeek(GyroBodyX_filt, &t2, portMAX_DELAY);
-    t3 = t1 * filt_coeff[0] + t2 * filt_coeff[1];
-    xQueueOverwrite(GyroBodyX_filt, &t3);
-    xQueuePeek(GyroBodyY, &t1, portMAX_DELAY);
-    xQueuePeek(GyroBodyY_filt, &t2, portMAX_DELAY);
-    t3 = t1 * filt_coeff[0] + t2 * filt_coeff[1];
-    xQueueOverwrite(GyroBodyY_filt, &t3);
-    xQueuePeek(GyroBodyZ, &t1, portMAX_DELAY);
-    xQueuePeek(GyroBodyZ_filt, &t2, portMAX_DELAY);
-    t3 = t1 * filt_coeff[0] + t2 * filt_coeff[1];
-    xQueueOverwrite(GyroBodyZ_filt, &t3);
+    filterOne(GyroBodyX, GyroBodyX_filt);
+    filterOne(GyroBodyY, GyroBodyY_filt);
+    filterOne(GyroBodyZ, GyroBodyZ_filt);
   }
 }
 
@@ -1006,10 +1016,12 @@ void TaskCANComms(void *pvParemeters) {
     switch (i) {
       case 0:
         xQueuePeek(Latitude, &d1, portMAX_DELAY);
-        TxFrame.identifier = 0x500;
+        d1 = (d1 - LATITUDE_OFFSET) / LATITUDE_SCALE;
+        TxFrame.identifier = 0x250;
         TxFrame.extd = 0;
         TxFrame.data_length_code = 8;
-        memcpy(&t1, &d1, sizeof(double));
+        //memcpy(&t1, &d1, sizeof(double));
+        t1 = (uint64_t)(d1);
         for (j = 0; j < 8; j++) {
           t2 = (t1 >> (j * 8)) & 0x00000000000000FF;
           t3 = (uint8_t)(t2);
@@ -1020,10 +1032,12 @@ void TaskCANComms(void *pvParemeters) {
         break;
       case 1:
         xQueuePeek(Longitude, &d1, portMAX_DELAY);
-        TxFrame.identifier = 0x501;
+        d1 = (d1 - LONGITUDE_OFFSET) / LONGITUDE_SCALE;
+        TxFrame.identifier = 0x251;
         TxFrame.extd = 0;
         TxFrame.data_length_code = 8;
-        memcpy(&t1, &d1, sizeof(double));
+        //memcpy(&t1, &d1, sizeof(double));
+        t1 = (uint64_t)(d1);
         for (j = 0; j < 8; j++) {
           t2 = (t1 >> (j * 8)) & 0x00000000000000FF;
           t3 = (uint8_t)(t2);
@@ -1034,10 +1048,12 @@ void TaskCANComms(void *pvParemeters) {
         break;
       case 2:
         xQueuePeek(Altitude, &d1, portMAX_DELAY);
-        TxFrame.identifier = 0x502;
+        d1 = (d1 - ALTITUDE_OFFSET) / ALTITUDE_SCALE;
+        TxFrame.identifier = 0x252;
         TxFrame.extd = 0;
         TxFrame.data_length_code = 8;
-        memcpy(&t1, &d1, sizeof(double));
+        //memcpy(&t1, &d1, sizeof(double));
+        t1 = (uint64_t)(d1);
         for (j = 0; j < 8; j++) {
           t2 = (t1 >> (j * 8)) & 0x00000000000000FF;
           t3 = (uint8_t)(t2);
@@ -1048,17 +1064,21 @@ void TaskCANComms(void *pvParemeters) {
         break;
       case 3:
         xQueuePeek(VelBodyX, &f1, portMAX_DELAY);
+        f1 = (f1 - VELBODYX_OFFSET) / VELBODYX_SCALE;
         xQueuePeek(VelBodyY, &f2, portMAX_DELAY);
-        TxFrame.identifier = 0x503;
+        f2 = (f2 - VELBODYY_OFFSET) / VELBODYY_SCALE;
+        TxFrame.identifier = 0x253;
         TxFrame.extd = 0;
         TxFrame.data_length_code = 8;
-        memcpy(&t4, &f1, sizeof(float));
+        //memcpy(&t4, &f1, sizeof(float));
+        t4 = (uint32_t)(f1);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
           TxFrame.data[j] = t3;
         }
-        memcpy(&t4, &f2, sizeof(float));
+        //memcpy(&t4, &f2, sizeof(float));
+        t4 = (uint32_t)(f2);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
@@ -1069,17 +1089,21 @@ void TaskCANComms(void *pvParemeters) {
         break;
       case 4:
         xQueuePeek(Yaw, &f1, portMAX_DELAY);
+        f1 = (f1 - YAW_OFFSET) / YAW_SCALE;
         xQueuePeek(Pitch, &f2, portMAX_DELAY);
-        TxFrame.identifier = 0x504;
+        f2 = (f2 - PITCH_OFFSET) / PITCH_SCALE;
+        TxFrame.identifier = 0x254;
         TxFrame.extd = 0;
         TxFrame.data_length_code = 8;
-        memcpy(&t4, &f1, sizeof(float));
+        //memcpy(&t4, &f1, sizeof(float));
+        t4 = (uint32_t)(f1);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
           TxFrame.data[j] = t3;
         }
-        memcpy(&t4, &f2, sizeof(float));
+        //memcpy(&t4, &f2, sizeof(float));
+        t4 = (uint32_t)(f2);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
@@ -1090,17 +1114,21 @@ void TaskCANComms(void *pvParemeters) {
         break;
       case 5:
         xQueuePeek(Roll, &f1, portMAX_DELAY);
+        f1 = (f1 - ROLL_OFFSET) / ROLL_SCALE;
         xQueuePeek(LinBodyAccZ_filt, &f2, portMAX_DELAY);
-        TxFrame.identifier = 0x505;
+        f2 = (f2 - LINBODYACCZ_OFFSET) / LINBODYACCZ_SCALE;
+        TxFrame.identifier = 0x255;
         TxFrame.extd = 0;
         TxFrame.data_length_code = 8;
-        memcpy(&t4, &f1, sizeof(float));
+        //memcpy(&t4, &f1, sizeof(float));
+        t4 = (uint32_t)(f1);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
           TxFrame.data[j] = t3;
         }
-        memcpy(&t4, &f2, sizeof(float));
+        //memcpy(&t4, &f2, sizeof(float));
+        t4 = (uint32_t)(f2);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
@@ -1111,17 +1139,21 @@ void TaskCANComms(void *pvParemeters) {
         break;
       case 6:
         xQueuePeek(LinBodyAccX_filt, &f1, portMAX_DELAY);
+        f1 = (f1 - LINBODYACCX_OFFSET) / LINBODYACCX_SCALE;
         xQueuePeek(LinBodyAccY_filt, &f2, portMAX_DELAY);
-        TxFrame.identifier = 0x506;
+        f2 = (f2 - LINBODYACCY_OFFSET) / LINBODYACCY_SCALE;
+        TxFrame.identifier = 0x256;
         TxFrame.extd = 0;
         TxFrame.data_length_code = 8;
-        memcpy(&t4, &f1, sizeof(float));
+        //memcpy(&t4, &f1, sizeof(float));
+        t4 = (uint32_t)(f1);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
           TxFrame.data[j] = t3;
         }
-        memcpy(&t4, &f2, sizeof(float));
+        //memcpy(&t4, &f2, sizeof(float));
+        t4 = (uint32_t)(f2);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
@@ -1132,17 +1164,21 @@ void TaskCANComms(void *pvParemeters) {
         break;
       case 7:
         xQueuePeek(QuatX_filt, &f1, portMAX_DELAY);
+        f1 = (f1 - QUATX_OFFSET) / QUATX_SCALE;
         xQueuePeek(QuatY_filt, &f2, portMAX_DELAY);
-        TxFrame.identifier = 0x507;
+        f2 = (f2 - QUATY_OFFSET) / QUATY_SCALE;
+        TxFrame.identifier = 0x257;
         TxFrame.extd = 0;
         TxFrame.data_length_code = 8;
-        memcpy(&t4, &f1, sizeof(float));
+        //memcpy(&t4, &f1, sizeof(float));
+        t4 = (uint32_t)(f1);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
           TxFrame.data[j] = t3;
         }
-        memcpy(&t4, &f2, sizeof(float));
+        //memcpy(&t4, &f2, sizeof(float));
+        t4 = (uint32_t)(f2);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
@@ -1153,17 +1189,21 @@ void TaskCANComms(void *pvParemeters) {
         break;
       case 8:
         xQueuePeek(QuatZ_filt, &f1, portMAX_DELAY);
+        f1 = (f1 - QUATZ_OFFSET) / QUATZ_SCALE;
         xQueuePeek(QuatS_filt, &f2, portMAX_DELAY);
-        TxFrame.identifier = 0x508;
+        f2 = (f2 - QUATS_OFFSET) / QUATS_SCALE;
+        TxFrame.identifier = 0x258;
         TxFrame.extd = 0;
         TxFrame.data_length_code = 8;
-        memcpy(&t4, &f1, sizeof(float));
+        //memcpy(&t4, &f1, sizeof(float));
+        t4 = (uint32_t)(f1);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
           TxFrame.data[j] = t3;
         }
-        memcpy(&t4, &f2, sizeof(float));
+        //memcpy(&t4, &f2, sizeof(float));
+        t4 = (uint32_t)(f2);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
@@ -1174,7 +1214,7 @@ void TaskCANComms(void *pvParemeters) {
         break;
       case 9:
         xQueuePeek(TimeUtcY, &t3, portMAX_DELAY);
-        TxFrame.identifier = 0x509;
+        TxFrame.identifier = 0x259;
         TxFrame.extd = 0;
         TxFrame.data_length_code = 8;
         TxFrame.data[0] = t3;
@@ -1198,17 +1238,21 @@ void TaskCANComms(void *pvParemeters) {
         break;
       case 10:
         xQueuePeek(GyroBodyX_filt, &f1, portMAX_DELAY);
+        f1 = (f1 - GYROBODYX_OFFSET) / GYROBODYX_SCALE;
         xQueuePeek(GyroBodyY_filt, &f2, portMAX_DELAY);
-        TxFrame.identifier = 0x50A;
+        f2 = (f2 - GYROBODYX_OFFSET) / GYROBODYX_SCALE;
+        TxFrame.identifier = 0x25A;
         TxFrame.extd = 0;
         TxFrame.data_length_code = 8;
-        memcpy(&t4, &f1, sizeof(float));
+        //memcpy(&t4, &f1, sizeof(float));
+        t4 = (uint32_t)(f1);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
           TxFrame.data[j] = t3;
         }
-        memcpy(&t4, &f2, sizeof(float));
+        //memcpy(&t4, &f2, sizeof(float));
+        t4 = (uint32_t)(f2);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
@@ -1219,11 +1263,13 @@ void TaskCANComms(void *pvParemeters) {
         break;
       case 11:
         xQueuePeek(GyroBodyZ_filt, &f1, portMAX_DELAY);
+        f1 = (f1 - GYROBODYZ_OFFSET) / GYROBODYZ_SCALE;
         xQueuePeek(INS_status, &t6, portMAX_DELAY);
-        TxFrame.identifier = 0x50B;
+        TxFrame.identifier = 0x25B;
         TxFrame.extd = 0;
         TxFrame.data_length_code = 6;
-        memcpy(&t4, &f1, sizeof(float));
+        //memcpy(&t4, &f1, sizeof(float));
+        t4 = (uint32_t)(f1);
         for (j = 0; j < 4; j++) {
           t5 = (t4 >> (j * 8)) & 0x000000FF;
           t3 = (uint8_t)(t5);
@@ -1234,6 +1280,7 @@ void TaskCANComms(void *pvParemeters) {
         t3 = (uint8_t)((t6 >> 8) & 0x00FF);
         TxFrame.data[5] = t3;
         ESP32Can.writeFrame(TxFrame, 0);
+        //TelnetStream.print("/r/nHello/r/n");
         i = 0;
         break;
       default:
@@ -1245,5 +1292,5 @@ void TaskCANComms(void *pvParemeters) {
 
 //hello
 void loop() {
-  vTaskDelay(1000 / portTICK_PERIOD_MS);
+  vTaskDelay(10000 / portTICK_PERIOD_MS);
 }
