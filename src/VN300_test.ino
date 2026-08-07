@@ -66,8 +66,8 @@ right turn -> negative slip angles
 // MTF positions relative to VN300:
 // Left  = (+x1, -y)
 // Right = (+x1, +y)
-#define MTF01_X1_M 0.787f  // replace with measured value
-#define MTF01_Y_M 0.29f    // replace with measured value
+#define MTF01_X1_M -1.3f  // replace with measured value
+#define MTF01_Y_M 0.55f    // replace with measured value
 
 // Angle from MTF01 +X axis to VN300/body +X/+Y axes.
 // Change to 135, -135, or -45 after straight-line testing if needed.
