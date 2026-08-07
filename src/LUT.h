@@ -9,19 +9,19 @@ static const float steering_wheel_deg[STEERING_LUT_SIZE] = {
 };
 
 static const float steer_fl_deg_pos[STEERING_LUT_SIZE] = {
-  0.000, 0.901, 1.795, 2.683, 3.566,
-  4.443, 5.315, 6.183, 7.047, 7.906,
-  8.762, 9.614, 10.463, 11.309, 12.152,
-  12.992, 13.830, 14.666, 15.500, 16.332,
-  17.162
+  0.0000, 0.9295, 1.8680, 2.8180, 3.7800,
+  4.7540, 5.7410, 6.7420, 7.7590, 8.7920,
+  9.8430, 10.9130, 12.0050, 13.1190, 14.2580,
+  15.4250, 16.6220, 17.8540, 19.1230, 20.4360,
+  21.7970
 };
 
 static const float steer_fr_deg_pos[STEERING_LUT_SIZE] = {
-  0.000, 0.907, 1.822, 2.744, 3.674,
-  4.613, 5.562, 6.520, 7.489, 8.469,
-  9.461, 10.466, 11.485, 12.519, 13.569,
-  14.637, 15.724, 16.831, 17.961, 19.115,
-  20.296
+  0.0000, 0.9210, 1.8300, 2.7320, 3.6270,
+  4.5140, 5.3940, 6.2670, 7.1340, 7.9950,
+  8.8510, 9.7020, 10.5470, 11.3880, 12.2250,
+  13.0580, 13.8870, 14.7120, 15.5340, 16.3530,
+  17.1680
 };
 
 int find_segment(float x, const float *x_table, int size) {
@@ -82,11 +82,11 @@ void steering_wheel_to_front_angles(float steering_wheel_deg_in,
                                STEERING_LUT_SIZE);
 
   if (steering_wheel_deg_in >= 0.0f) {
-    // Positive steering direction, table as-given
+    // Positive CAN steering is a left turn: FL is inside and turns more.
     *fl_deg = fl_pos;
     *fr_deg = fr_pos;
   } else {
-    // Mirror for opposite steering direction
+    // Negative CAN steering is a right turn: FR is inside and turns more.
     *fl_deg = -fr_pos;
     *fr_deg = -fl_pos;
   }
