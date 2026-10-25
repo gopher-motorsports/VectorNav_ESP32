@@ -17,6 +17,18 @@
 #define REAR_TRACKWIDTH_M 1.18f
 #define WHEELBASE_M 1.6f
 
+//parameters for debugging
+constexpr uint32_t VN_READY_PACKETS_REQUIRED = 20;
+static_assert(VN_READY_PACKETS_REQUIRED > 0,
+              "Required packet count must be greater than zero");
+volatile uint32_t vnRxBytes = 0;
+volatile uint32_t vnValidPackets = 0;
+volatile uint32_t vnCrcErrors = 0;
+volatile uint32_t vnReadyStreak = 0;
+volatile uint32_t vnLastValidMs = 0;
+volatile uint16_t vnLastStatus = 0;
+volatile bool vnLoggingReleased = false;
+
 volatile bool crcFail000B = false;
 volatile bool crcFail0046 = false;
 volatile bool crcFail0040 = false;
@@ -509,69 +521,99 @@ void TaskVN300Config(void *pvParameters) {
 
 void TaskVN300CheckStatus(void *pvParameters) {
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-  char c = 0x00;
-  char temp = 0x00;
-  uint8_t i = 0;
-  uint32_t ready_count = 0;
-  uint16_t type_byte = 0x0000;
-  uint16_t ins_status = 0x0000;
-  uint16_t crc = 0x0000;
-  while (1) {
-    if (ready_count > 10) {
-      TelnetStream.print("Ready!\r\n");
-      xTaskNotifyGive(VN300_Update_Task_Handle);
-      xTaskNotifyGive(Serial_Print_Task_Handle);
-      vTaskDelete(NULL);
+
+  bool collecting = false;
+  uint8_t packet[7];
+  uint8_t used = 0;
+  uint32_t packetStarted = 0;
+
+  // Expected startup packet:
+  // FA 20 01 00 statusLo statusHi crcHi crcLo
+
+  while (true) {
+    uint32_t now = millis();
+
+    // A gap longer than 100 ms breaks the consecutive packet streak.
+    if (vnReadyStreak && now - vnLastValidMs > 100) {
+      vnReadyStreak = 0;
     }
-    switch (i) {
-      case 0:
-        c = Serial2.read();
-        if (c == 0xFA) {
-          i = 1;
-          vTaskDelay(10 / portTICK_PERIOD_MS);
-        }
-        break;
-      case 1:
-        c = Serial2.read();
-        if (c == 0x20) {
-          i = 2;
-        } else {
-          i = 0;
-        }
-        break;
-      case 2:
-        c = Serial2.read();
-        temp = (uint16_t)(c & 0x00FF);
-        c = Serial2.read();
-        temp |= (uint16_t)(c << 8);
-        if (temp == 0x00001) {
-          i = 3;
-        } else {
-          i = 0;
-        }
-        break;
-      case 3:
-        c = Serial2.read();
-        ins_status = (uint16_t)(c & 0x00FF);
-        c = Serial2.read();
-        ins_status |= (uint16_t)(c << 8);
-        ins_status &= 0x0377;
-        //Serial.println(ins_status,BIN);
-        c = Serial2.read();
-        crc = (uint16_t)(c & 0x00FF);
-        c = Serial2.read();
-        crc |= (uint16_t)(c << 8);
-        xQueueOverwrite(INS_status, &ins_status);
-        if (((ins_status & 0x0003) > 0) && ((ins_status | 0x018B) == 0x038F)) {
-          ready_count++;
-        } else {
-          ready_count = 0;
-        }
-        i = 0;
-        break;
-      default:
-        i = 0;
+
+    if (collecting && now - packetStarted > 100) {
+      collecting = false;
+      used = 0;
+      vnReadyStreak = 0;
     }
+
+    for (unsigned n = 0; n < 256 && Serial2.available(); ++n) {
+      int value = Serial2.read();
+      if (value < 0) break;
+
+      uint8_t b = (uint8_t)value;
+      vnRxBytes++;
+
+      if (!collecting) {
+        if (b == 0xFA) {
+          collecting = true;
+          used = 0;
+          packetStarted = millis();
+        }
+        continue;
+      }
+
+      packet[used++] = b;
+
+      // Check the expected group and status-only field selection.
+      if ((used == 1 && packet[0] != 0x20) ||
+          (used == 2 && packet[1] != 0x01) ||
+          (used == 3 && packet[2] != 0x00)) {
+        vnReadyStreak = 0;
+        collecting = (b == 0xFA);
+        used = 0;
+        packetStarted = millis();
+        continue;
+      }
+
+      if (used < sizeof(packet)) continue;
+
+      collecting = false;
+      used = 0;
+
+      uint16_t calculated = 0;
+      for (unsigned j = 0; j < 5; ++j) {
+        calculated = vn_crc_update(calculated, packet[j]);
+      }
+
+      uint16_t received =
+          ((uint16_t)packet[5] << 8) | packet[6];
+
+      if (calculated != received) {
+        vnCrcErrors++;
+        vnReadyStreak = 0;
+        continue;
+      }
+
+      vnLastStatus =
+          (uint16_t)packet[3] | ((uint16_t)packet[4] << 8);
+
+      uint16_t statusForQueue = vnLastStatus & 0x0377;
+      xQueueOverwrite(INS_status, &statusForQueue);
+
+      vnValidPackets++;
+      vnLastValidMs = millis();
+      vnReadyStreak++;
+
+      // Require valid communication, regardless of satellite fix.
+      if (vnReadyStreak >= VN_READY_PACKETS_REQUIRED) {
+        vnLoggingReleased = true;
+
+        xTaskNotifyGive(VN300_Update_Task_Handle);
+        xTaskNotifyGive(Serial_Print_Task_Handle);
+
+        vTaskDelete(NULL);
+      }
+    }
+
+    vTaskDelay(1);
   }
 }
 
@@ -1028,7 +1070,7 @@ void TaskTelnetPrint(void *pvParemeters) {
   while (1) {
     while (TelnetStream.available()) {
       temp = TelnetStream.read();
-      if ((uint8_t)(temp) >= 48 && (uint8_t)(temp) <= 54) {
+      if (temp >= '0' && temp <= '7') {
         c = temp;
         i = ((uint8_t)(c)-48);
       }
@@ -1041,6 +1083,7 @@ void TaskTelnetPrint(void *pvParemeters) {
         TelnetStream.print("Enter 4 for Steering and Slip Angles\r\n");
         TelnetStream.print("Enter 5 for MTF01 Fusion Data\r\n");
         TelnetStream.print("Enter 6 for CAN RX Statistics\r\n");
+        TelnetStream.print("Enter 7 for VectorNav diagnostics\r\n");
         TelnetStream.print("Enter 0 to restart the menu\r\n");
         while (!TelnetStream.available()) {
         }
@@ -1493,6 +1536,69 @@ void TaskTelnetPrint(void *pvParemeters) {
 
           break;
         }
+      case 7:
+        {
+          uint32_t now = millis();
+          uint32_t valid = vnValidPackets;
+          uint32_t streak = vnReadyStreak;
+          bool released = vnLoggingReleased;
+
+          TelnetStream.println("\r\n--- VectorNav diagnostics ---");
+
+          TelnetStream.print("CSV logging startup: ");
+          TelnetStream.println(
+              released ? "ENABLED" : "WAITING FOR VALID COMMUNICATION");
+
+          TelnetStream.print("Ready streak: ");
+          TelnetStream.print(streak);
+          TelnetStream.print(" / ");
+          TelnetStream.print(VN_READY_PACKETS_REQUIRED);
+          TelnetStream.println(" valid packets required");
+
+          TelnetStream.print("Startup bytes received: ");
+          TelnetStream.println(vnRxBytes);
+
+          TelnetStream.print("Verified startup packets: ");
+          TelnetStream.println(valid);
+
+          TelnetStream.print("Startup CRC errors: ");
+          TelnetStream.println(vnCrcErrors);
+
+          if (released) {
+            TelnetStream.println(
+                "Startup check: PASSED. Startup counters are now frozen.");
+            TelnetStream.println(
+                "Use options 2 and 3 to check current measurements.");
+          } else {
+            TelnetStream.print("Connection: ");
+
+            if (vnRxBytes == 0) {
+              TelnetStream.println("NO DATA - no UART bytes received");
+            } else if (valid == 0) {
+              TelnetStream.println(
+                  "UNVERIFIED - bytes arriving, no valid status packets");
+            } else if (now - vnLastValidMs <= 100) {
+              TelnetStream.println(
+                  "LIVE - verified packet received within 0.1 second");
+            } else {
+              TelnetStream.println(
+                  "STALE - no verified packet for over 0.1 second");
+            }
+          }
+
+          if (valid > 0) {
+            TelnetStream.print("Status at startup check: 0x");
+            TelnetStream.println(vnLastStatus, HEX);
+
+            TelnetStream.print("Satellite fix at startup check: ");
+            TelnetStream.println((vnLastStatus & 0x0004) ? "YES" : "NO");
+          }
+
+          TelnetStream.println(
+              "Satellite fix is NOT required to start recording.");
+
+          break;
+        }
       default:
         i = 0;
     }
@@ -1881,7 +1987,7 @@ void TaskCANComms(void *pvParemeters) {
           t3 = (uint8_t)(t2);
           TxFrame.data[j] = t3;
         }
-        ESP32Can.writeFrame(TxFrame, 0);
+        // ESP32Can.writeFrame(TxFrame, 0);
         i = 1;
         break;
       case 1:
@@ -1897,7 +2003,7 @@ void TaskCANComms(void *pvParemeters) {
           t3 = (uint8_t)(t2);
           TxFrame.data[j] = t3;
         }
-        ESP32Can.writeFrame(TxFrame, 0);
+        // ESP32Can.writeFrame(TxFrame, 0);
         i = 2;
         break;
       case 2:
@@ -1913,7 +2019,7 @@ void TaskCANComms(void *pvParemeters) {
           t3 = (uint8_t)(t2);
           TxFrame.data[j] = t3;
         }
-        ESP32Can.writeFrame(TxFrame, 0);
+        // ESP32Can.writeFrame(TxFrame, 0);
         i = 3;
         break;
       case 3:
@@ -1938,7 +2044,7 @@ void TaskCANComms(void *pvParemeters) {
           t3 = (uint8_t)(t5);
           TxFrame.data[j + 4] = t3;
         }
-        ESP32Can.writeFrame(TxFrame, 0);
+        // ESP32Can.writeFrame(TxFrame, 0);
         i = 4;
         break;
       case 4:
@@ -1963,7 +2069,7 @@ void TaskCANComms(void *pvParemeters) {
           t3 = (uint8_t)(t5);
           TxFrame.data[j + 4] = t3;
         }
-        ESP32Can.writeFrame(TxFrame, 0);
+        // ESP32Can.writeFrame(TxFrame, 0);
         i = 5;
         break;
       case 5:
@@ -1988,7 +2094,7 @@ void TaskCANComms(void *pvParemeters) {
           t3 = (uint8_t)(t5);
           TxFrame.data[j + 4] = t3;
         }
-        ESP32Can.writeFrame(TxFrame, 0);
+        // ESP32Can.writeFrame(TxFrame, 0);
         i = 6;
         break;
       case 6:
@@ -2013,7 +2119,7 @@ void TaskCANComms(void *pvParemeters) {
           t3 = (uint8_t)(t5);
           TxFrame.data[j + 4] = t3;
         }
-        ESP32Can.writeFrame(TxFrame, 0);
+        // ESP32Can.writeFrame(TxFrame, 0);
         i = 7;
         break;
       case 7:
@@ -2038,7 +2144,7 @@ void TaskCANComms(void *pvParemeters) {
           t3 = (uint8_t)(t5);
           TxFrame.data[j + 4] = t3;
         }
-        ESP32Can.writeFrame(TxFrame, 0);
+        // ESP32Can.writeFrame(TxFrame, 0);
         i = 8;
         break;
       case 8:
@@ -2063,7 +2169,7 @@ void TaskCANComms(void *pvParemeters) {
           t3 = (uint8_t)(t5);
           TxFrame.data[j + 4] = t3;
         }
-        ESP32Can.writeFrame(TxFrame, 0);
+        // ESP32Can.writeFrame(TxFrame, 0);
         i = 9;
         break;
       case 9:
@@ -2087,7 +2193,7 @@ void TaskCANComms(void *pvParemeters) {
         TxFrame.data[6] = t3;
         t3 = (uint8_t)(t6 & 0x00FF);
         TxFrame.data[7] = t3;
-        ESP32Can.writeFrame(TxFrame, 0);
+        // ESP32Can.writeFrame(TxFrame, 0);
         i = 10;
         break;
       case 10:
@@ -2112,7 +2218,7 @@ void TaskCANComms(void *pvParemeters) {
           t3 = (uint8_t)(t5);
           TxFrame.data[j + 4] = t3;
         }
-        ESP32Can.writeFrame(TxFrame, 0);
+        // ESP32Can.writeFrame(TxFrame, 0);
         i = 11;
         break;
       case 11:
@@ -2133,7 +2239,7 @@ void TaskCANComms(void *pvParemeters) {
         TxFrame.data[4] = t3;
         t3 = (uint8_t)(t6 & 0x00FF);
         TxFrame.data[5] = t3;
-        ESP32Can.writeFrame(TxFrame, 0);
+        // ESP32Can.writeFrame(TxFrame, 0);
         //TelnetStream.print("/r/nHello/r/n");
         i = 12;
         break;
@@ -2180,7 +2286,7 @@ void TaskCANComms(void *pvParemeters) {
           TxFrame.data[6] = (uint8_t)(((uint16_t)rawRR >> 8) & 0xFF);
           TxFrame.data[7] = (uint8_t)((uint16_t)rawRR & 0xFF);
 
-          ESP32Can.writeFrame(TxFrame, 0);
+          // ESP32Can.writeFrame(TxFrame, 0);
 
           i = 0;
           break;
